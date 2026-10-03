@@ -76,11 +76,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
 
   int abort = 0;
 
+  // KS: KernelStep stamping compiled in (see GenericOp).
+  template <bool KS>
   inline __device__ void waitSend(int nbytes) {
     uint64_t waitStart = 0;
     if (sendConnHeadPtr) {
       int spins = 0;
-      const bool timeWait = COMPILER_EXPECT(stepProf, 0) && wid < fan.nsend() && sendSameHost[wid] &&
+      const bool timeWait = KS && wid < fan.nsend() && sendSameHost[wid] &&
                             profilerKernelStepRankFits(sendPeerRank[wid]);
       if (timeWait) waitStart = globaltimer();
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
@@ -92,8 +94,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
       }
       sendConnHead += 1;
     }
-    if (COMPILER_EXPECT(stepProf, 0) && tid < WARP_SIZE && wid < fan.nsend() &&
-        wid < NCCL_KERNEL_STEP_MAX_ARITY) {
+    if (KS && tid < WARP_SIZE && wid < fan.nsend() && wid < NCCL_KERNEL_STEP_MAX_ARITY) {
       ncclShmem.groups[group].kernelStepWaitStartSend[wid] = waitStart;
     }
   }
@@ -310,8 +311,16 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
   static constexpr int DataEltPerSlice =
     (WireWordPerSlice - WireWordPerSlice / NCCL_LL128_LINEELEMS) * (sizeof(uint64_t) / sizeof(T));
 
+  // One copy of the LL128 loop per KernelStep state, chosen once per call (as in LL): the stamping
+  // code stays out of the steady-state loop.
   template <int RECV, int SEND, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void GenericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
+    if (COMPILER_EXPECT(stepProf, 0)) GenericOpImpl<true, RECV, SEND, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+    else GenericOpImpl<false, RECV, SEND, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+  }
+
+  template <bool KS, int RECV, int SEND, int SrcBuf, int DstBuf>
+  __device__ __forceinline__ void GenericOpImpl(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
     constexpr int SRC = SrcBuf != -1 ? 1 : 0;
     constexpr int DST = DstBuf != -1 ? 1 : 0;
     T const* srcPtr = SrcBuf == -1 ? nullptr : userBufs[SrcBuf] + srcIx;
@@ -320,7 +329,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
     const int nwarps = nthreads / WARP_SIZE;
     nelem = nelem < 0 ? 0 : nelem;
 
-    if (SEND) waitSend(divUp(nelem, DataEltPerSlice) * WireWordPerSlice * sizeof(uint64_t));
+    if (SEND) waitSend<KS>(divUp(nelem, DataEltPerSlice) * WireWordPerSlice * sizeof(uint64_t));
     barrier();
 
     nelem -= DataEltPerSlice * warp;
@@ -333,7 +342,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
       const uint32_t sliceBytes = (uint32_t)(min(nelem, DataEltPerSlice * nwarps) * sizeof(T));
       const uint32_t sliceStep = (uint32_t)wireOffset;
       const uint64_t sampleIndex = kernelStepLogicalIndex;
-      if (COMPILER_EXPECT(stepProf, 0) && tid == 0) {
+      if (KS && tid == 0) {
         const bool sampled = profilerKernelStepSample(stepProf, kernelStepSampleRate, sampleIndex);
         bool anyEligible = false;
         if (RECV && recvStepProf) {
@@ -370,7 +379,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>
       recvReduceSendCopy<NCCL_LL128_SHMEM_ELEMS_PER_THREAD, RECV, SEND, SrcBuf, DstBuf>(regs, wireOffset, postOp);
       if (DST) storeRegs(dstPtr, regs, eltInSlice);
 
-      if (COMPILER_EXPECT(stepProf, 0) && tid == 0) {
+      if (KS && tid == 0) {
         if (RECV) {
           for (int i = 0; i < fan.nrecv() && i < NCCL_KERNEL_STEP_MAX_ARITY; i++) {
             uint64_t seq = ncclShmem.groups[group].kernelStepSeqRecv[0][i];

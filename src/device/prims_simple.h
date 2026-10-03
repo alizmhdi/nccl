@@ -105,19 +105,19 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
     return ld_volatile_global(ptr);
   }
 
-  template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst>
+  // KS: KernelStep send-wait stamping compiled in (genericOp with profilerStepEnabled work only).
+  template <int DirectRecv, int DirectSend, int Recv, int Send, int Src, int Dst, bool KS = false>
   __device__ __forceinline__ void waitPeer(intptr_t srcIx, intptr_t dstIx, int offset, int nelts) {
     const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
     // Yes, for some template arguments this code will be unreachable.  That's fine.
     // coverity[dead_error_line]
-    kernelStepStartTs = 0;
+    if (KS) kernelStepStartTs = 0;
     if ((flags & (Recv * RoleWaitRecv)) || (flags & (Send * RoleWaitSend))) {
       int spins = 0;
       // Send-phase credit wait: record wait-start; CoMMA derives duration vs transfer start.
       // Only when KernelStep will stamp (same-host peer).
       const bool timeSendWait =
-        COMPILER_EXPECT(stepProf, 0) && connSameHost && profilerKernelStepRankFits(connPeer) &&
-        (flags & (Send * RoleWaitSend));
+        KS && connSameHost && profilerKernelStepRankFits(connPeer) && (flags & (Send * RoleWaitSend));
       uint64_t waitStart = timeSendWait ? globaltimer() : 0;
       while (connStepCache + (isSendNotRecv ? NCCL_STEPS : 0) < step + StepPerSlice) {
         connStepCache = loadStepValue(connStepPtr);
@@ -188,8 +188,18 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
     }
   }
 
+  // One copy of genericOp per KernelStep state, chosen once per call: the per-slice stamping code
+  // and its state otherwise share registers with reduceCopy even while KernelSteps are off.
   template <int DirectRecv1, int DirectSend1, int Recv, int Send, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void genericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
+    if (COMPILER_EXPECT(stepProf, 0))
+      genericOpImpl<true, DirectRecv1, DirectSend1, Recv, Send, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+    else
+      genericOpImpl<false, DirectRecv1, DirectSend1, Recv, Send, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+  }
+
+  template <bool KS, int DirectRecv1, int DirectSend1, int Recv, int Send, int SrcBuf, int DstBuf>
+  __device__ __forceinline__ void genericOpImpl(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
     constexpr int DirectRecv = 1 && Direct && DirectRecv1;
     constexpr int DirectSend = 1 && Direct && DirectSend1;
     constexpr int Src = SrcBuf != -1;
@@ -239,7 +249,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
           if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf == Input ? userInput : userOutput) + srcIx + offset;
           if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf == Input ? userInput : userOutput) + dstIx + offset;
         }
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
+        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst, KS>(srcIx, dstIx, offset, sliceSize);
         subBarrier();
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
@@ -247,7 +257,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
         // KernelStep start: after waitPeer, before reduceCopy (Wait roles only).
         // Skip inter-host peers (NET); only stamp same-host P2P/SHM/NVLS. Inter-host
         // send/recv rely on ProxySteps instead.
-        if (COMPILER_EXPECT(stepProf, 0) && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
+        if (KS && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
           const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
           uint64_t seq = 0;
           const bool directionEnabled = isSendNotRecv || recvStepProf;
@@ -316,7 +326,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < workSize);
         // KernelStep stop: after postPeer (Post roles only); seq published by Wait role.
-        if (COMPILER_EXPECT(stepProf, 0) && (flags & (Recv * RolePostRecv | Send * RolePostSend))) {
+        if (KS && (flags & (Recv * RolePostRecv | Send * RolePostSend))) {
           const bool isSendNotRecv = (Send && Recv) ? (flags & RolePostSend) : Send;
           uint64_t seq = index >= NCCL_KERNEL_STEP_MAX_ARITY ? 0
                          : isSendNotRecv ? ncclShmem.groups[group].kernelStepSeqSend[slice & 1][index]
@@ -341,11 +351,11 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
       sliceSize = sliceSize < nelem - offset ? sliceSize : nelem - offset;
       { // Only workers could have Wait roles so we know the slice must be empty
         // since we've exited the loop above.
-        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, sliceSize);
+        waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst, KS>(0, 0, 0, sliceSize);
       }
       int workSize = ncclShmem.aborted ? 0 : sliceSize;
       // Empty trailing slices: do not stamp / do not advance sample index.
-      if (COMPILER_EXPECT(stepProf, 0) && workSize > 0 && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
+      if (KS && workSize > 0 && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
         const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
         uint64_t seq = 0;
         const bool directionEnabled = isSendNotRecv || recvStepProf;
@@ -365,7 +375,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
           if (isSendNotRecv) ncclShmem.groups[group].kernelStepSeqSend[slice & 1][index] = seq;
           else ncclShmem.groups[group].kernelStepSeqRecv[slice & 1][index] = seq;
         }
-      } else if (COMPILER_EXPECT(stepProf, 0) && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
+      } else if (KS && (flags & (Recv * RoleWaitRecv | Send * RoleWaitSend))) {
         kernelStepStartTs = 0;
         const bool isSendNotRecv = (Send && Recv) ? (flags & RoleWaitSend) : Send;
         if (index < NCCL_KERNEL_STEP_MAX_ARITY) {
@@ -375,7 +385,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
       }
       barrier(); // Has couterpart in preceding worker-only loop.
       postPeer<Recv, Send>(0 < workSize);
-      if (COMPILER_EXPECT(stepProf, 0) && (flags & (Recv * RolePostRecv | Send * RolePostSend))) {
+      if (KS && (flags & (Recv * RolePostRecv | Send * RolePostSend))) {
         const bool isSendNotRecv = (Send && Recv) ? (flags & RolePostSend) : Send;
         uint64_t seq = index >= NCCL_KERNEL_STEP_MAX_ARITY ? 0
                        : isSendNotRecv ? ncclShmem.groups[group].kernelStepSeqSend[slice & 1][index]

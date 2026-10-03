@@ -79,11 +79,14 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
 
   int abort = 0;
 
+  // KS: KernelStep stamping compiled in (the work has profilerStepEnabled). The KS=false copy is
+  // stock NCCL's code: no stamping branches or extra live state in the LL hot path.
+  template <bool KS>
   inline __device__ void waitSend(int nbytes) {
     uint64_t waitStart = 0;
     if (sendConnHeadPtr) {
       int spins = 0;
-      const bool timeWait = COMPILER_EXPECT(stepProf, 0) && wid < fan.nsend() && sendSameHost[wid] &&
+      const bool timeWait = KS && wid < fan.nsend() && sendSameHost[wid] &&
                             profilerKernelStepRankFits(sendPeerRank[wid]);
       if (timeWait) waitStart = globaltimer();
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
@@ -98,8 +101,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
       }
       sendConnHead += 1;
     }
-    if (COMPILER_EXPECT(stepProf, 0) && tid < WARP_SIZE && wid < fan.nsend() &&
-        wid < NCCL_KERNEL_STEP_MAX_ARITY) {
+    if (KS && tid < WARP_SIZE && wid < fan.nsend() && wid < NCCL_KERNEL_STEP_MAX_ARITY) {
       ncclShmem.groups[group].kernelStepWaitStartSend[wid] = waitStart;
     }
     barrier();
@@ -258,8 +260,17 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
     }
   }
 
+  // One copy of the LL loop per KernelStep state, chosen once per call: KernelSteps are off in the
+  // steady state, and their stamping code inflated the shared loop past the 96-register cap
+  // (spills in AllGather/ReduceScatter LL, which stock NCCL compiles without any).
   template <int RECV, int SEND, int SrcBuf, int DstBuf>
   __device__ __forceinline__ void LLGenericOp(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
+    if (COMPILER_EXPECT(stepProf, 0)) LLGenericOpImpl<true, RECV, SEND, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+    else LLGenericOpImpl<false, RECV, SEND, SrcBuf, DstBuf>(srcIx, dstIx, nelem, postOp);
+  }
+
+  template <bool KS, int RECV, int SEND, int SrcBuf, int DstBuf>
+  __device__ __forceinline__ void LLGenericOpImpl(intptr_t srcIx, intptr_t dstIx, int nelem, bool postOp) {
     constexpr int SRC = SrcBuf != -1 ? 1 : 0;
     constexpr int DST = DstBuf != -1 ? 1 : 0;
     T* srcElts = SrcBuf == -1 ? nullptr : userBufs[SrcBuf] + srcIx;
@@ -267,7 +278,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
 
     // Always waitSend in case of cleanup
     nelem = nelem < 0 ? 0 : nelem;
-    if (SEND) waitSend(divUp(nelem, EltPerLine) * sizeof(ncclLLFifoLine));
+    if (SEND) waitSend<KS>(divUp(nelem, EltPerLine) * sizeof(ncclLLFifoLine));
 
     nelem -= tid * EltPerLine;
     srcElts += tid * EltPerLine;
@@ -283,7 +294,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
       const uint32_t lineStep = (uint32_t)offset;
       // Continuous sample index across LLGenericOp calls.
       const uint64_t sampleIndex = kernelStepLogicalIndex;
-      if (COMPILER_EXPECT(stepProf, 0) && tid == 0) {
+      if (KS && tid == 0) {
         const bool sampled = profilerKernelStepSample(stepProf, kernelStepSampleRate, sampleIndex);
         bool anyEligible = false;
         if (RECV && recvStepProf) {
@@ -356,7 +367,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>
       }
 
       // KernelStep stop: after this line's stores.
-      if (COMPILER_EXPECT(stepProf, 0) && tid == 0) {
+      if (KS && tid == 0) {
         if (RECV) {
           for (int i = 0; i < fan.nrecv() && i < NCCL_KERNEL_STEP_MAX_ARITY; i++) {
             uint64_t seq = ncclShmem.groups[group].kernelStepSeqRecv[0][i];
