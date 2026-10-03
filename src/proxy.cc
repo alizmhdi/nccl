@@ -779,7 +779,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
     break;
   case ncclPatternProfiler:
     {
-      if (ncclProfilerNeedsProxy(comm, op)) NCCLCHECK(SaveProxyProfiler(comm, op, justInquire));
+      if (ncclProfilerNeedsProxy(comm, op) && !op->profilerSkipKernelCh) NCCLCHECK(SaveProxyProfiler(comm, op, justInquire));
       else incWorkCounter(comm, op);
     }
     break;
@@ -821,12 +821,13 @@ static ncclResult_t removeOp(struct ncclProxyProgressState* state, struct ncclPr
 }
 
 static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclProxyProgressState* state,
-                                struct ncclProxyArgs* opStart, int* idle) {
+                                struct ncclProxyArgs* opStart, int* idle, int* onlyProfiler) {
   struct ncclProxyArgs* prevOp = NULL;
   struct ncclProxyArgs* op = opStart;
   ncclResult_t status = ncclSuccess;
   while (op) {
     if (op->state == ncclProxyOpNone) return ncclInternalError;
+    if (op->pattern != ncclPatternProfiler) *onlyProfiler = 0;
     TIME_START(0);
     TIME_START(1);
     ncclResult_t ret = op->progress(proxyState, op);
@@ -946,6 +947,10 @@ void ncclDumpProxyState(int signal) {
 // Set to SIGUSR1 or SIGUSR2 to help debug proxy state during hangs
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
+// > 0: when every active op is a profiler op (KernelCh/KernelStep polling of the kernel's host
+// stamps) and none progressed, sleep this many microseconds instead of spinning. The stamps carry
+// the GPU's own timestamps, so polling later does not move the events; network ops never sleep.
+NCCL_PARAM(ProfilerPollSleepUs, "PROFILER_POLL_SLEEP_US", 0);
 
 static ncclAffinity proxyCpuset;
 static std::once_flag proxyCpusetOnceFlag;
@@ -997,9 +1002,11 @@ void* ncclProxyProgress(void* proxyState_) {
    * ncclParamProgressAppendOpFreq(). If they are equal, we will append proxy ops. This will decrease the
    * frequency of calling ncclProxyGetPostedOps() and reduce the perf impact. */
   int proxyOpAppendCounter = 0;
+  const int64_t profilerPollSleepUs = ncclParamProfilerPollSleepUs();
   do {
     int idle = 1;
-    ncclResult_t ret = progressOps(proxyState, state, state->active, &idle);
+    int onlyProfiler = 1;
+    ncclResult_t ret = progressOps(proxyState, state, state->active, &idle, &onlyProfiler);
     if (ret != ncclSuccess) {
       COMPILER_ATOMIC_STORE(&proxyState->asyncResult, ret, std::memory_order_release);
       INFO_LOC(NCCL_ALL, "-> %d [Progress Thread]", ret);
@@ -1024,7 +1031,11 @@ void* ncclProxyProgress(void* proxyState_) {
         INFO_LOC(NCCL_ALL, "-> %d [Progress Thread]", ret);
       }
       if (added == 0) {
-        std::this_thread::yield(); // No request progressed. Let others run.
+        if (idle && onlyProfiler && state->active && profilerPollSleepUs > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(profilerPollSleepUs));
+        } else {
+          std::this_thread::yield(); // No request progressed. Let others run.
+        }
       }
     }
     lastIdle = idle;

@@ -32,6 +32,11 @@ NCCL_PARAM(SymCeThreshold, "SYM_CE_THRESHOLD", 8 * 1024 * 1024);
 
 NCCL_PARAM(ProfilerKernelStepSampleRate, "PROFILER_KERNEL_STEP_SAMPLE_RATE", 2);
 
+// 1: profiler proxy ops (KernelCh start/stop) on the first channel of each collective only, while
+// KernelSteps are off. A profiler needing one GPU start and one completion per collective then
+// costs one proxy op instead of one per channel. P2P ops keep every channel.
+NCCL_PARAM(ProfilerKernelChFirstChannel, "PROFILER_KERNEL_CH_FIRST_CHANNEL", 0);
+
 static uint8_t profilerKernelStepSampleRate() {
   int64_t rate = ncclParamProfilerKernelStepSampleRate();
   if (rate < 1) return 1;
@@ -582,10 +587,14 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
 }
 
 static ncclResult_t addProfilerProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan,
-                                               struct ncclProxyOp* op) {
+                                               struct ncclProxyOp* op, bool firstChannel) {
   int tmp = op->pattern;
   op->pattern = ncclPatternProfiler;
+  // KernelSteps are drained per channel by these proxy ops, so they keep every channel.
+  op->profilerSkipKernelCh = !firstChannel && ncclParamProfilerKernelChFirstChannel() &&
+                             !(op->eActivationMask & ncclProfileKernelStep);
   ncclResult_t ret = ncclAddProxyOpIfNeeded(comm, plan, op);
+  op->profilerSkipKernelCh = false;
   op->pattern = tmp;
   return ret;
 }
@@ -667,7 +676,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         ncclAddWorkBatchToPlan(comm, plan, c, workNode->workType, task->devFuncId, plan->workBytes);
         // Set pattern to profiler to add a proxy profiler for kernel events
         NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, &proxyOp));
-        NCCLCHECK(addProfilerProxyOpIfNeeded(comm, plan, &proxyOp));
+        NCCLCHECK(addProfilerProxyOpIfNeeded(comm, plan, &proxyOp, c == (int)devWork->channelLo));
       }
     } else {
       // not task->isCollnet
@@ -822,7 +831,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         // determine if that's actually true but it's also not clear if that would be an issue.
         // coverity[uninit_use_in_call:FALSE]
         NCCLCHECK(ncclAddProxyOpIfNeeded(comm, plan, proxyOp));
-        NCCLCHECK(addProfilerProxyOpIfNeeded(comm, plan, proxyOp));
+        NCCLCHECK(addProfilerProxyOpIfNeeded(comm, plan, proxyOp, c == (int)devWork->channelLo));
       }
     }
 
@@ -1133,7 +1142,10 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
         proxyOps[dir].nChannels = nChannels[dir];
         proxyOps[dir].nPeers = concurrentTasks[dir];
         NCCLCHECKGOTO(ncclAddProxyOpIfNeeded(comm, plan, &proxyOps[dir]), ret, cleanup);
-        NCCLCHECKGOTO(addProfilerProxyOpIfNeeded(comm, plan, &proxyOps[dir]), ret, cleanup);
+        // P2P keeps every channel: a member's parts finish at different times, and its completion
+        // (the last KernelCh stop) times EP's grouped all-to-all.
+        NCCLCHECKGOTO(addProfilerProxyOpIfNeeded(comm, plan, &proxyOps[dir], /*firstChannel=*/true), ret,
+                      cleanup);
       }
     }
   }

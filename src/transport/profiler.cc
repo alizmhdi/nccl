@@ -158,18 +158,26 @@ static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, str
     args->state = ncclProxyOpProgress;
   }
   if (args->state == ncclProxyOpProgress) {
+    // Idle unless a KernelCh event fires, like the network transports: a profiler op waiting on
+    // the GPU used to keep the progress loop from ever yielding (or sleeping, see
+    // NCCL_PROFILER_POLL_SLEEP_US).
+    args->idle = 1;
     for (int s = 0; s < args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs + s;
       struct ncclDevProfiler* workStarted = (struct ncclDevProfiler*)sub->sendbuff;
       struct ncclDevProfiler* workCompleted = (struct ncclDevProfiler*)sub->recvbuff;
 
       profilerDrainKernelSteps(args, s, comm);
+      // KernelStep rings are bounded: an op that drains them never counts as idle, so the
+      // proxy keeps its full polling rate while KernelSteps are on.
+      if (sub->eActivationMask & ncclProfileKernelStep) args->idle = 0;
 
       if (sub->posted < sub->nsteps &&
           sub->base <= workStarted[sub->channelId].data[sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL].counter) {
         ncclProfilerStartKernelChEvent(
           args, s, workStarted[sub->channelId].data[sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL].timestamp);
         sub->posted = sub->nsteps;
+        args->idle = 0;
         continue; // allow events on every channel to start
       }
       if (sub->transmitted < sub->nsteps &&
@@ -182,6 +190,7 @@ static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, str
           args, s, workCompleted[sub->channelId].data[sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL].timestamp);
         sub->transmitted = sub->nsteps;
         args->done++;
+        args->idle = 0;
       }
     }
     if (args->done == args->nsubs) args->state = ncclProxyOpNone;

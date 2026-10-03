@@ -119,6 +119,10 @@ struct ncclProxyOp {
   // done
   // by setting incWorkCounter to 'true' only for one of the p2ps in the pair during enqueue.
   bool incWorkCounter;
+  // Profiler proxy op skipped on this channel: KernelCh is tracked on the op's first channel only
+  // (NCCL_PROFILER_KERNEL_CH_FIRST_CHANNEL=1 while KernelSteps are off). The host work counter
+  // still advances, so it stays aligned with the kernel's per-channel counter.
+  bool profilerSkipKernelCh;
   int eActivationMask;
   void* taskEventHandle;
   int rank;
