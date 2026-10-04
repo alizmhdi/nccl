@@ -2650,6 +2650,12 @@ static ncclResult_t ncclPlannerSetCapturingGraph(struct ncclComm* comm, struct n
   return ncclSuccess;
 }
 
+// KernelSteps need the communicator's rings (devCommSetup: intra-host communicators only). Without
+// them, drop the KernelStep bits so the op keeps one KernelCh instead of tracking every channel.
+static inline int ncclProfilerTaskMask(struct ncclComm* comm, int mask) {
+  return comm->profiler.ksChannels > 0 ? mask : (mask & ~(ncclProfileKernelStep | ncclProfileKernelStepRecv));
+}
+
 static ncclResult_t p2pTaskAppend(struct ncclComm* comm, struct ncclInfo* info, ncclFunc_t coll, ncclFunc_t collAPI,
                                   void* buff, size_t count, ncclDataType_t datatype, int peer, bool allowUB) {
   struct ncclKernelPlanner* planner = &comm->planner;
@@ -2678,7 +2684,7 @@ static ncclResult_t p2pTaskAppend(struct ncclComm* comm, struct ncclInfo* info, 
   p2p->root = peer;
   p2p->bytes = nBytes;
   p2p->allowUB = allowUB;
-  p2p->eActivationMask = ncclProfilerApiState.eActivationMask;
+  p2p->eActivationMask = ncclProfilerTaskMask(comm, ncclProfilerApiState.eActivationMask);
   p2p->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   p2p->p2pApiEventHandle = ncclProfilerApiState.p2pApiEventHandle;
   ncclIntruQueueEnqueue(isSendNotRecv ? &planner->peers[peer].sendQueue : &planner->peers[peer].recvQueue, p2p);
@@ -2778,7 +2784,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->opDev = opDev; // C++ struct assignment
     t->chunkSteps = info->chunkSteps;
     t->sliceSteps = info->sliceSteps;
-    t->eActivationMask = ncclProfilerApiState.eActivationMask;
+    t->eActivationMask = ncclProfilerTaskMask(comm, ncclProfilerApiState.eActivationMask);
     t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
     t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;
 

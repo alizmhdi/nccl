@@ -40,17 +40,20 @@ struct ncclProfilerProxy {
   struct ncclDevProfiler* workStarted /*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted /*[MAXCHANNELS]*/;
   uint64_t workCounter[MAXCHANNELS]; // host work counter
-  // KernelStep dual rings (cuda host alloc, [MAXCHANNELS] elements each)
-  struct ncclDevKernelStepRing* stepStarted /*[MAXCHANNELS]*/;
-  struct ncclDevKernelStepRing* stepCompleted /*[MAXCHANNELS]*/;
-  uint64_t* stepSeq /*[MAXCHANNELS]*/;       // device-published high water (same buffer as device)
+  // Channels with KernelStep rings (0: none). KernelSteps are intra-host only, so only
+  // communicators with several ranks on this host get rings, one per channel they can use.
+  int ksChannels;
+  // KernelStep dual rings (cuda host alloc, [ksChannels] elements each)
+  struct ncclDevKernelStepRing* stepStarted /*[ksChannels]*/;
+  struct ncclDevKernelStepRing* stepCompleted /*[ksChannels]*/;
+  uint64_t* stepSeq /*[ksChannels]*/;        // device-published high water (same buffer as device)
   uint64_t stepStartCounter[MAXCHANNELS];    // host cursor for start publication
   uint64_t stepCounter[MAXCHANNELS];         // host cursor for completion publication
   // Plugin handles for start-visible KernelSteps.  A slot is opened when the
   // GPU start ring becomes visible and closed when its completion arrives.
   void** kernelStepHandles;
   uint64_t* kernelStepHandleSeq;
-  // KernelStep parent metadata [MAXCHANNELS][send/recv][MAX_KERNEL_STEP_PARENT_EVENTS], flat.
+  // KernelStep parent metadata [ksChannels][send/recv][MAX_KERNEL_STEP_PARENT_EVENTS], flat.
   // P2P send/recv tasks share a GPU work counter, so direction is required to route
   // sparse ring entries to the correct top-level task event.
   struct ncclKernelStepParent* kernelStepParents;

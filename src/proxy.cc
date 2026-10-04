@@ -476,15 +476,27 @@ static ncclResult_t ProxyAppend(struct ncclProxyProgressState* state, struct ncc
   return ncclSuccess;
 }
 
+// Whether a posted chain holds work other than profiler (KernelCh/KernelStep) ops.
+static bool ncclProxyChainNeedsProgress(struct ncclProxyOpsPool* pool, int nextOps, int nextOpsEnd) {
+  for (int i = nextOps; i != -1; i = (i == nextOpsEnd) ? -1 : pool->ops[i].next) {
+    if (pool->ops[i].pattern != ncclPatternProfiler) return true;
+  }
+  return false;
+}
+
 ncclResult_t ncclProxyPost(struct ncclProxyOpsPool* pool, int nextOps, int nextOpsEnd) {
   std::lock_guard<std::mutex> lock(pool->mutex);
+  // A progress thread between profiler polls picks profiler-only posts up within one poll
+  // interval by itself: wake it (a futex call on this, the launching, thread) only for work
+  // that must start now.
+  bool wake = pool->profilerPoll ? ncclProxyChainNeedsProgress(pool, nextOps, nextOpsEnd) : pool->nextOps == -1;
   if (pool->nextOps == -1) {
     pool->nextOps = nextOps;
-    pool->cond.notify_one();
   } else {
     pool->ops[pool->nextOpsEnd].next = nextOps;
   }
   pool->nextOpsEnd = nextOpsEnd;
+  if (wake) pool->cond.notify_one();
   return ncclSuccess;
 }
 
@@ -562,7 +574,8 @@ static void incWorkCounter(struct ncclComm* comm, struct ncclProxyOp* op) {
 }
 
 static void saveKernelStepParent(struct ncclComm* comm, struct ncclProxyOp* op) {
-  if (!(op->eActivationMask & ncclProfileKernelStep) || comm->profiler.kernelStepParents == nullptr) return;
+  if (!(op->eActivationMask & ncclProfileKernelStep) || comm->profiler.kernelStepParents == nullptr ||
+      op->channelId >= comm->profiler.ksChannels) return;
   int firstDir = op->coll == ncclFuncRecv ? 0 : 1;
   int lastDir = op->coll == ncclFuncSend ? 1 : 0;
   if (op->coll != ncclFuncSend && op->coll != ncclFuncRecv) firstDir = 0, lastDir = 1;
@@ -855,6 +868,15 @@ static ncclResult_t progressOps(struct ncclProxyState* proxyState, struct ncclPr
 
 NCCL_PARAM(ProxyAppendBatchSize, "PROXY_APPEND_BATCH_SIZE", 16);
 
+// > 0: when every active op is a profiler op (KernelCh/KernelStep polling of the kernel's host
+// stamps) and none progressed, wait up to this many microseconds on the ops pool instead of
+// spinning; posting transport work ends the wait at once. The stamps carry the GPU's own
+// timestamps, so polling later does not move the events; network ops never wait.
+NCCL_PARAM(ProfilerPollSleepUs, "PROFILER_POLL_SLEEP_US", 0);
+// With NCCL_PROFILER_POLL_SLEEP_US > 0: how long after the last profiler op the progress thread
+// keeps waking every poll interval (instead of blocking until the next post) while idle.
+NCCL_PARAM(ProfilerPollLingerMs, "PROFILER_POLL_LINGER_MS", 100);
+
 static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, int* added) {
   struct ncclProxyProgressState* state = &proxyState->progressState;
   if (state->opsPool == NULL) return ncclInternalError;
@@ -874,7 +896,19 @@ static ncclResult_t ncclProxyGetPostedOps(struct ncclProxyState* proxyState, int
       if (pool->nextOps == -1 && !state->stop) {
         ncclProfilerStartProxyCtrlEvent(proxyState->profilerContext, &eHandle);
         ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlSleep);
-        pool->cond.wait(lock);
+        const int64_t pollUs = ncclParamProfilerPollSleepUs();
+        if (pollUs > 0 && state->profilerActiveNs != 0 &&
+            clockNano() - state->profilerActiveNs < (uint64_t)ncclParamProfilerPollLingerMs() * 1000000ULL) {
+          // Profiler ops ran recently (one per collective with KernelCh): wait one poll interval
+          // at a time instead of blocking, so the next profiler-only post needs no futex wake on
+          // the launching thread (ncclProxyPost skips it while profilerPoll is set). Transport
+          // work still wakes us at once.
+          pool->profilerPoll = 1;
+          pool->cond.wait_for(lock, std::chrono::microseconds(pollUs));
+          pool->profilerPoll = 0;
+        } else {
+          pool->cond.wait(lock);
+        }
         ncclProfilerRecordProxyCtrlEventState(eHandle, 0, ncclProfilerProxyCtrlWakeup);
         ncclProfilerStopProxyCtrlEvent(eHandle);
       }
@@ -947,10 +981,6 @@ void ncclDumpProxyState(int signal) {
 // Set to SIGUSR1 or SIGUSR2 to help debug proxy state during hangs
 NCCL_PARAM(ProxyDumpSignal, "PROXY_DUMP_SIGNAL", -1);
 NCCL_PARAM(ProgressAppendOpFreq, "PROGRESS_APPENDOP_FREQ", 8);
-// > 0: when every active op is a profiler op (KernelCh/KernelStep polling of the kernel's host
-// stamps) and none progressed, sleep this many microseconds instead of spinning. The stamps carry
-// the GPU's own timestamps, so polling later does not move the events; network ops never sleep.
-NCCL_PARAM(ProfilerPollSleepUs, "PROFILER_POLL_SLEEP_US", 0);
 
 static ncclAffinity proxyCpuset;
 static std::once_flag proxyCpusetOnceFlag;
@@ -1007,6 +1037,7 @@ void* ncclProxyProgress(void* proxyState_) {
     int idle = 1;
     int onlyProfiler = 1;
     ncclResult_t ret = progressOps(proxyState, state, state->active, &idle, &onlyProfiler);
+    if (state->active && onlyProfiler && profilerPollSleepUs > 0) state->profilerActiveNs = clockNano();
     if (ret != ncclSuccess) {
       COMPILER_ATOMIC_STORE(&proxyState->asyncResult, ret, std::memory_order_release);
       INFO_LOC(NCCL_ALL, "-> %d [Progress Thread]", ret);
@@ -1032,7 +1063,16 @@ void* ncclProxyProgress(void* proxyState_) {
       }
       if (added == 0) {
         if (idle && onlyProfiler && state->active && profilerPollSleepUs > 0) {
-          std::this_thread::sleep_for(std::chrono::microseconds(profilerPollSleepUs));
+          // Only profiler ops are active, waiting on the GPU (which timestamps KernelCh and
+          // KernelStep events itself): sleep until the next poll instead of spinning a core
+          // next to the launch threads, but return at once when new transport work is posted.
+          struct ncclProxyOpsPool* pool = state->opsPool;
+          std::unique_lock<std::mutex> lock(pool->mutex);
+          if (pool->nextOps == -1 && state->stop == 0) {
+            pool->profilerPoll = 1;
+            pool->cond.wait_for(lock, std::chrono::microseconds(profilerPollSleepUs));
+            pool->profilerPoll = 0;
+          }
         } else {
           std::this_thread::yield(); // No request progressed. Let others run.
         }
@@ -1491,6 +1531,7 @@ static ncclResult_t proxyProgressInit(struct ncclProxyState* proxyState) {
                           &state->handle));
     // Init pool
     pool->nextOps = -1;
+    pool->profilerPoll = 0;
 
     for (int r = 0; r < proxyState->tpLocalnRanks; r++) {
       pool->freeOps[r] = r * MAX_OPS_PER_PEER;

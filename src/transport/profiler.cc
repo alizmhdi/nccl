@@ -104,6 +104,7 @@ static void profilerDrainKernelSteps(struct ncclProxyArgs* args, int s, struct n
       comm->profiler.kernelStepParents == nullptr) return;
 
   int ch = sub->channelId;
+  if (ch >= comm->profiler.ksChannels) return;
   uint64_t produced = comm->profiler.stepSeq[ch];
 
   uint64_t starts = comm->profiler.stepStartCounter[ch];
@@ -167,10 +168,10 @@ static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, str
       struct ncclDevProfiler* workStarted = (struct ncclDevProfiler*)sub->sendbuff;
       struct ncclDevProfiler* workCompleted = (struct ncclDevProfiler*)sub->recvbuff;
 
+      // KernelStep stamps carry GPU timestamps and each channel's ring holds
+      // MAX_KERNEL_STEP_EVENTS_PER_CHANNEL of them, so draining once per poll interval loses
+      // nothing: an op with KernelSteps on may idle (and sleep) like any other.
       profilerDrainKernelSteps(args, s, comm);
-      // KernelStep rings are bounded: an op that drains them never counts as idle, so the
-      // proxy keeps its full polling rate while KernelSteps are on.
-      if (sub->eActivationMask & ncclProfileKernelStep) args->idle = 0;
 
       if (sub->posted < sub->nsteps &&
           sub->base <= workStarted[sub->channelId].data[sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL].counter) {

@@ -487,11 +487,13 @@ struct ncclKernelComm {
   // Profiler counters
   struct ncclDevProfiler* workStarted /*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted /*[MAXCHANNELS]*/;
-  // KernelStep rings (per-slice start/end); nullptr until allocated at init
-  struct ncclDevKernelStepRing* stepStarted /*[MAXCHANNELS]*/;
-  struct ncclDevKernelStepRing* stepCompleted /*[MAXCHANNELS]*/;
+  // KernelStep rings (per-slice start/end) for channels [0, ksChannels); nullptr when the
+  // communicator has none (no other rank on this host)
+  struct ncclDevKernelStepRing* stepStarted /*[ksChannels]*/;
+  struct ncclDevKernelStepRing* stepCompleted /*[ksChannels]*/;
   // Monotonic per-channel KernelStep sequence (device atomicAdd); host drain cursor is separate
-  uint64_t* stepSeq /*[MAXCHANNELS]*/;
+  uint64_t* stepSeq /*[ksChannels]*/;
+  int ksChannels;
 };
 
 struct alignas(16) ncclKernelCommAndChannels {

@@ -393,6 +393,7 @@ __device__ __forceinline__ void profilerKernelStepStart(bool enabled, int isSend
                                                          uint64_t* seqOut) {
   if (!enabled || ncclShmem.comm.stepStarted == nullptr || ncclShmem.comm.stepSeq == nullptr) return;
   int ch = ncclShmem.channelId;
+  if (ch >= ncclShmem.comm.ksChannels) return;
   uint64_t seq = atomicAdd((unsigned long long*)(ncclShmem.comm.stepSeq + ch), 1ULL) + 1ULL;
   *seqOut = seq;
   struct ncclDevKernelStepEvent* e =
@@ -412,6 +413,7 @@ __device__ __forceinline__ void profilerKernelStepStop(bool enabled, uint64_t se
                                                         uint32_t step, uint32_t size) {
   if (!enabled || ncclShmem.comm.stepCompleted == nullptr || seq == 0) return;
   int ch = ncclShmem.channelId;
+  if (ch >= ncclShmem.comm.ksChannels) return;
   struct ncclDevKernelStepEvent* e =
     &ncclShmem.comm.stepCompleted[ch].data[seq % MAX_KERNEL_STEP_EVENTS_PER_CHANNEL];
   e->ready_ts = globaltimer(); // step end

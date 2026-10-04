@@ -653,18 +653,31 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   tmpCommAndChans.comm.workCompleted = comm->profiler.workCompleted;
   ncclCommPushCudaHostFree(comm, comm->profiler.workStarted);
   ncclCommPushCudaHostFree(comm, comm->profiler.workCompleted);
-  if (ncclProfilerKernelStepSupported()) {
-    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepStarted, MAXCHANNELS), ret, fail);
-    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepCompleted, MAXCHANNELS), ret, fail);
-    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepSeq, MAXCHANNELS), ret, fail);
+  // KernelSteps are intra-host only (P2P/SHM/NVLS peers), so only a communicator with another
+  // rank on this host gets rings, and only for the channels its kernels can run on. Each channel
+  // costs two pinned 5 MiB rings plus about 7 MiB of host bookkeeping; sized for MAXCHANNELS on
+  // every communicator, that was about 12 GB of pinned memory per Megatron process (18
+  // communicators), which kept the kernel compacting memory (and shooting down the training
+  // threads' TLBs) during training.
+  comm->profiler.ksChannels = 0;
+  if (ncclProfilerKernelStepSupported() && comm->localRanks > 1) {
+    comm->profiler.ksChannels = std::min(MAXCHANNELS,
+      std::max(std::max(comm->nChannels, comm->collChannels), std::max(comm->nvlsChannels, comm->p2pnChannels)));
+  }
+  tmpCommAndChans.comm.ksChannels = comm->profiler.ksChannels;
+  if (comm->profiler.ksChannels > 0) {
+    int ksChannels = comm->profiler.ksChannels;
+    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepStarted, ksChannels), ret, fail);
+    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepCompleted, ksChannels), ret, fail);
+    NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->profiler.stepSeq, ksChannels), ret, fail);
     NCCLCHECKGOTO(ncclCalloc(&comm->profiler.kernelStepHandles,
-                            MAXCHANNELS * MAX_KERNEL_STEP_EVENTS_PER_CHANNEL), ret, fail);
+                            (size_t)ksChannels * MAX_KERNEL_STEP_EVENTS_PER_CHANNEL), ret, fail);
     ncclCommPushFree(comm, comm->profiler.kernelStepHandles);
     NCCLCHECKGOTO(ncclCalloc(&comm->profiler.kernelStepHandleSeq,
-                            MAXCHANNELS * MAX_KERNEL_STEP_EVENTS_PER_CHANNEL), ret, fail);
+                            (size_t)ksChannels * MAX_KERNEL_STEP_EVENTS_PER_CHANNEL), ret, fail);
     ncclCommPushFree(comm, comm->profiler.kernelStepHandleSeq);
     NCCLCHECKGOTO(ncclCalloc(&comm->profiler.kernelStepParents,
-                            MAXCHANNELS * 2 * MAX_KERNEL_STEP_PARENT_EVENTS), ret, fail);
+                            (size_t)ksChannels * 2 * MAX_KERNEL_STEP_PARENT_EVENTS), ret, fail);
     ncclCommPushFree(comm, comm->profiler.kernelStepParents);
     tmpCommAndChans.comm.stepStarted = comm->profiler.stepStarted;
     tmpCommAndChans.comm.stepCompleted = comm->profiler.stepCompleted;

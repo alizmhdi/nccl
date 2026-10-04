@@ -241,6 +241,9 @@ struct ncclProxyOpsPool {
   volatile int nextOps;
   volatile int nextOpsEnd;
   volatile int freeOps[NCCL_MAX_LOCAL_RANKS];
+  // Set (under mutex) while the progress thread waits out a profiler poll interval
+  // (NCCL_PROFILER_POLL_SLEEP_US); posts of profiler-only ops then skip the wakeup.
+  int profilerPoll;
   std::mutex mutex;
   std::condition_variable cond;
 };
@@ -293,6 +296,8 @@ struct ncclProxyProgressState {
   struct ncclProxyArgs* pool;
   struct ncclProxyPool* pools;
   int nextOps;
+  // Last time (clockNano) the progress loop ran profiler ops; see ncclProxyGetPostedOps.
+  uint64_t profilerActiveNs;
 };
 
 // Expected proxy response fifo
