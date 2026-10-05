@@ -537,11 +537,15 @@ __device__ __forceinline__ void ncclKernelMain(struct ncclDevKernelArgs const* a
     __syncthreads();
   }
   // Intermediate batches synchronize before profiler(STOP). Do the same for
-  // the terminal batch when KernelStep tracking is active so thread 0 cannot
-  // publish workCompleted before recv/send roles publish their final step ends.
-  bool anyProfilerStepEnabled = false;
-  for (int i = 0; i < ncclShmem.nWorks; i++) anyProfilerStepEnabled |= profilerStepEnabled(i);
-  if (anyProfilerStepEnabled) __syncthreads();
+  // the terminal batch whenever it publishes work markers: thread 0 stamps
+  // every work of the batch complete, but a P2P batch splits the block's warps
+  // between its works, so warp 0 may finish an intra-host recv while another
+  // work still waits for a stalled peer (EP4: groups stamped complete up to
+  // 14 ms before their kernel ended). With KernelStep tracking active this
+  // also orders workCompleted after the send/recv roles' final step ends.
+  bool anyProfilerMarkers = false;
+  for (int i = 0; i < ncclShmem.nWorks; i++) anyProfilerMarkers |= profilerWorkMarkersEnabled(i);
+  if (anyProfilerMarkers) __syncthreads();
   profiler(FINI);
 }
 
