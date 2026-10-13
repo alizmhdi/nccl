@@ -615,6 +615,14 @@ ncclResult_t ncclProfilerStartProxyOpEvent(int s, struct ncclProxyArgs* args) {
       eDescr.proxyOp.nSteps = DIVUP(sub->nsteps, args->sliceSteps);
       eDescr.proxyOp.chunkSize = args->chunkSize * args->sliceSteps;
       eDescr.proxyOp.isSend = args->progress == ncclTransports[TRANSPORT_NET]->send.proxyProgress ? 1 : 0;
+      struct ncclProxyConnection* connection = sub->connection;
+      if (connection && connection->netName[0]) {
+        eDescr.proxyOp.netDev = connection->netDev;
+        eDescr.proxyOp.netPort = connection->netPort;
+        eDescr.proxyOp.netName = connection->netName;
+      } else {
+        eDescr.proxyOp.netDev = -1;
+      }
       ncclProfiler->startEvent(sub->profilerContext, &sub->opEventHandle, &eDescr);
     }
   }

@@ -730,6 +730,12 @@ static ncclResult_t proxySharedInit(struct ncclProxyConnection* connection, stru
   return ncclSuccess;
 }
 
+static void netConnectionSetDevice(struct ncclProxyConnection* connection, int netDev, const ncclNetProperties_t* props) {
+  connection->netDev = netDev;
+  connection->netPort = props->port;
+  snprintf(connection->netName, sizeof(connection->netName), "%s", props->name ? props->name : "");
+}
+
 static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState,
                                    void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
   struct setupReq* req = (struct setupReq*)reqBuff;
@@ -750,6 +756,7 @@ static ncclResult_t sendProxySetup(struct ncclProxyConnection* connection, struc
   resources->sameDevice = req->sameDevice;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
+  netConnectionSetDevice(connection, req->netDev, &props);
   /* DMA-BUF support */
   resources->useDmaBuf = resources->useGdr && proxyState->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF);
   resources->maxRecvs = props.maxRecvs;
@@ -792,6 +799,7 @@ static ncclResult_t recvProxySetup(struct ncclProxyConnection* connection, struc
   resources->sameDevice = req->sameDevice;
   ncclNetProperties_t props;
   NCCLCHECK(proxyState->ncclNet->getProperties(req->netDev, &props));
+  netConnectionSetDevice(connection, req->netDev, &props);
   /* DMA-BUF support */
   resources->useDmaBuf = resources->useGdr && proxyState->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF);
   resources->maxRecvs = props.maxRecvs;

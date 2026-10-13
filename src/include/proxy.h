@@ -424,6 +424,12 @@ struct ncclProxyConnection {
   struct ncclCollNetSharedRes* collNet;
   int needsProxyProgress;
   struct ncclIntruQueue<struct proxyMemHandle, &proxyMemHandle::next> proxyMemHandleQueue;
+  // Network device of a NET connection (set by its proxy setup), for the profiler's ProxyOp
+  // events: the plugin's device index, its port and name (e.g. "mlx5_3", or "mlx5_0+mlx5_1"
+  // for a merged device). netName[0] == 0 on other transports.
+  int netDev;
+  int netPort;
+  char netName[128];
 };
 
 typedef ncclResult_t (*threadFunc_t)(struct ncclProxyArgs*);

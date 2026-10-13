@@ -75,6 +75,11 @@ typedef struct {
       int nSteps;
       int chunkSize;
       int isSend;
+      // Network device this op's connection uses: plugin device index (-1: not a NET
+      // connection), port, and name (e.g. "mlx5_3"; valid for the call only).
+      int netDev;
+      int netPort;
+      const char* netName;
     } proxyOp;
 
     struct {
